@@ -6,6 +6,8 @@
 #include<set>
 #include<map>
 #include<cassert>
+#include<cstdio>
+#include<unordered_map>
 
 #include "ilu.h"
 
@@ -307,12 +309,11 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
         }
     }
 
-    // Adding my local internal rows to R_int for uniformity.
-    for (auto e : my_entries) {
-        if (row_types[e.row - first_row] == 0) {
-            R_int.push_back(e);
-        }
-    }
+    // NOTE: local interior rows are deliberately NOT added to R_int. The
+    // pivot lookup below is guarded by "col < first_row", so only foreign
+    // rows are ever looked up; local rows keyed by their permuted global id
+    // could never match, and appending them costs O(local_nnz) per
+    // convergence iteration in the pivot map rebuild.
 
     // 6. Initialize L_sep and U_sep
     vector<Entry> L_sep, U_sep;
@@ -335,6 +336,13 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
         }
     }
 
+    // R_int is fixed once the step-5 exchange has completed, so index it once
+    // rather than rebuilding the map on every convergence iteration.
+    unordered_map<int, vector<Entry*>> pivot_int;
+    for (auto& e : R_int) pivot_int[e.row].push_back(&e);
+
+    int iter = 0;
+    const int MAX_ITER = 50;
     while(true) {
         vector<Entry> old_entries = my_entries;
 
@@ -424,17 +432,29 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
         }
 
         // Factorize sep rows
-        map<int, vector<Entry*>> pivot_rows;
-        for (auto& e : R_int) pivot_rows[e.row].push_back(&e);
-        for (auto& e : R_sep) pivot_rows[e.row].push_back(&e);
+        // R_sep is rebuilt every iteration, so it needs a fresh index; R_int
+        // is reused from pivot_int above. A given foreign row is either
+        // interior or separator on its owner, never both, so the two maps
+        // cannot disagree.
+        unordered_map<int, vector<Entry*>> pivot_sep;
+        for (auto& e : R_sep) pivot_sep[e.row].push_back(&e);
 
         for (int i = 0; i < (int)row_types.size(); i++) {
             if (row_types[i] != 1) continue;
             for (int e_idx = row_start[i]; e_idx < row_start[i+1]; e_idx++) {
                 int col = my_entries[e_idx].col;
                 if (col >= first_row) continue;
-                if (pivot_rows.find(col) == pivot_rows.end()) continue;
-                auto& prow = pivot_rows[col];
+                vector<Entry*>* prow_p = nullptr;
+                {
+                    auto it = pivot_sep.find(col);
+                    if (it != pivot_sep.end()) prow_p = &it->second;
+                    else {
+                        auto it2 = pivot_int.find(col);
+                        if (it2 != pivot_int.end()) prow_p = &it2->second;
+                    }
+                }
+                if (prow_p == nullptr) continue;
+                auto& prow = *prow_p;
                 double pivot = 0.0;
                 for (auto* e : prow) { if (e->col == col) { pivot = e->val; break; } }
                 if (abs(pivot) < 1e-14) continue;
@@ -469,7 +489,17 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
 
         double global_max;
         MPI_Allreduce(&max_change, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        iter++;
+        if (rank == 0) {
+            fprintf(stderr, "  [factorize] iter %d  max_change=%.3e\n", iter, global_max);
+            fflush(stderr);
+        }
         if (global_max < 1e-9) break;
+        if (iter >= MAX_ITER) {
+            if (rank == 0)
+                fprintf(stderr, "  [factorize] WARNING: hit MAX_ITER=%d without converging\n", MAX_ITER);
+            break;
+        }
     }
 
 
