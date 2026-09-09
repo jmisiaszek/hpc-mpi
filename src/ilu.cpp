@@ -5,6 +5,7 @@
 #include<string>
 #include<set>
 #include<map>
+#include<cassert>
 
 #include "ilu.h"
 
@@ -47,37 +48,17 @@ int row_to_rank(int N, int world_size, int row) {
     return ((row + 1) * world_size - 1) / N;
 }
 
-// A row is a separator row if it needs data this rank does not own: either it
-// has a nonzero in a column owned by a lower rank, or it depends (transitively,
-// through the local lower triangle) on a row that does.
-//
-// NOTE: the transitive closure is what keeps the U-row exchange below correct.
-// The sender picks the U part of a requested row using the *permuted* local
-// order, while the receiver filters those entries with `e->col <= col` in the
-// *original* global numbering; the two only agree while perm is the identity,
-// which the closure guarantees (a partition ends up all-interior or
-// all-separator for the matrices we run). Dropping the closure -- which would
-// be a large win, since it currently pulls the whole local factorization into
-// the iterative loop -- first needs that exchange to agree on one numbering.
 vector<int> check_int_sep(int start_row, int end_row, vector<Entry>& entries) {
     vector<int> rows(end_row - start_row + 1, 0);
-
+    
+    // A row is a separator iff it directly references a column owned by a
+    // lower rank. No transitive propagation: after the symmetric block-local
+    // permutation, interior rows are numbered before separator rows, so every
+    // sub-diagonal column of an interior row is itself an interior row and
+    // its value never changes across convergence iterations.
     for (const auto& e : entries) {
         if (e.col < start_row) {
             rows[e.row - start_row] = 1;
-        }
-    }
-
-    bool changed = true;
-    while(changed) {
-        changed = false;
-        for (const auto& e : entries) {
-            if (e.col >= start_row && e.col < e.row) {
-                if (rows[e.col - start_row] == 1 && rows[e.row - start_row] == 0) {
-                    rows[e.row - start_row] = 1;
-                    changed = true;
-                }
-            }
         }
     }
 
@@ -236,6 +217,11 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
         for (int e_idx = row_start[i]; e_idx < row_start[i + 1]; e_idx++) {
             // Entry e = my_entries[e_idx];
             if (my_entries[e_idx].col < i + first_row) {
+                // Invariant: an interior row's sub-diagonal columns are local
+                // interior rows. If this fires, the classification/permutation
+                // pair is inconsistent.
+                assert(my_entries[e_idx].col >= first_row);
+                assert(row_types[my_entries[e_idx].col - first_row] == 0);
                 factorize(
                     my_entries[e_idx].row - first_row, 
                     my_entries[e_idx].col - first_row, 
@@ -342,174 +328,125 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
     }
 
     // 7. Convergence loop
-    // Send out row requests.
-    for (int src = 0; src < rank; src++) {
-        set<int> need;
-        for (auto& e : my_entries) {
-            if (row_types[e.row - first_row] == 1 && e.col < first_row) {
-                if (row_to_rank(N, world_size, e.col) == src) {
-                    need.insert(e.col);
-                }
-            }
+    vector<Entry> A_sep;
+    for (auto& e: my_entries) {
+        if (row_types[e.row - first_row] == 1) {
+            A_sep.push_back(e);
         }
-        vector<int> tgs(need.begin(), need.end());
-        int size = tgs.size();
-        MPI_Send(&size, 1, MPI_INT, src, 0, MPI_COMM_WORLD);
-        if (size > 0)
-            MPI_Send(tgs.data(), size, MPI_INT, src, 1, MPI_COMM_WORLD);
-    }
-
-    // Receive incoming requests.
-    map<int, vector<int>> incoming_req;
-    for (int dest = rank + 1; dest < world_size; dest++) {
-        int size;
-        MPI_Recv(&size, 1, MPI_INT, dest, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        vector<int> req(size);
-        if (size > 0)
-            MPI_Recv(req.data(), size, MPI_INT, dest, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        incoming_req[dest] = req;
-    }
-
-    // Index of the first separator row: the permutation put every interior row
-    // before every separator row, so separator rows (and their entries) are one
-    // contiguous tail of my_entries.
-    int first_sep = 0;
-    while (first_sep < (int)row_types.size() && row_types[first_sep] == 0) first_sep++;
-    int sep_start_idx = row_start[first_sep];
-
-    // Original values of the separator entries, index-aligned with my_entries,
-    // so each iteration can reset them with a linear pass instead of searching
-    // A_sep for every single entry (that search was quadratic in nnz).
-    vector<double> A_sep_vals(my_entries.size());
-    for (size_t k = 0; k < my_entries.size(); k++) A_sep_vals[k] = my_entries[k].val;
-    vector<double> prev_vals(my_entries.size(), 0.0);
-
-    // Pivot rows taken from the interior rows of lower ranks. Those are final
-    // by now, so this index is built once instead of once per iteration; only
-    // the separator pivot rows change between iterations.
-    map<int, vector<Entry*>> pivot_int;
-    for (auto& e : R_int) {
-        if (e.row < first_row) pivot_int[e.row].push_back(&e);
     }
 
     while(true) {
+        vector<Entry> old_entries = my_entries;
 
-        // ---- Post all receives first ----
-        vector<int> sizes(rank, 0);
-        vector<MPI_Request> size_recv_reqs(rank);
+        // Send out row requests.
         for (int src = 0; src < rank; src++) {
-            MPI_Irecv(&sizes[src], 1, MPI_INT, src, 2, MPI_COMM_WORLD, &size_recv_reqs[src]);
+            set<int> need;
+            for (auto& e : my_entries) {
+                if (row_types[e.row - first_row] == 1 && e.col < first_row) {
+                    if (row_to_rank(N, world_size, e.col) == src) {
+                        need.insert(e.col);
+                    }
+                }
+            }
+            vector<int> tgs(need.begin(), need.end());
+            int size = tgs.size();
+            MPI_Send(&size, 1, MPI_INT, src, 0, MPI_COMM_WORLD);
+            if (size > 0)
+                MPI_Send(tgs.data(), size, MPI_INT, src, 1, MPI_COMM_WORLD);
         }
 
-        // ---- Prepare and post all sends ----
-        map<int, vector<Entry>> to_send_by_dest;
-        vector<MPI_Request> size_send_reqs;
+        // Receive incoming requests.
+        map<int, vector<int>> incoming_req;
+        for (int dest = rank + 1; dest < world_size; dest++) {
+            int size;
+            MPI_Recv(&size, 1, MPI_INT, dest, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            vector<int> req(size);
+            if (size > 0)
+                MPI_Recv(req.data(), size, MPI_INT, dest, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            incoming_req[dest] = req;
+        }
+
+        // Receive the row data from lower ranks.
+        vector<Entry> R_sep;
+        for (int src = 0; src < rank; src++) {
+            int size;
+            MPI_Recv(&size, 1, MPI_INT, src, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            if (size > 0) {
+                vector<Entry> buf(size);
+                MPI_Recv(buf.data(), size * sizeof(Entry), MPI_BYTE, src, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+                for (auto& e : buf) {
+                    if (e.col >= first_row && e.col <= last_row) {
+                        e.col = perm[e.col - first_row] + first_row;
+                    }
+                }
+
+                R_sep.insert(R_sep.end(), buf.begin(), buf.end());
+            }
+        }
+
+        // Send the row data to higher ranks.
         for (auto& [dest, req] : incoming_req) {
             vector<Entry> to_send;
             for (int req_row : req) {
                 if (req_row < first_row || req_row > last_row) continue;
                 int local_req = req_row - first_row;
                 int p_req = perm[local_req];
+
                 if (row_types[p_req] != 1) continue;
                 for (int idx = row_start[p_req]; idx < row_start[p_req + 1]; idx++) {
                     if (my_entries[idx].col < p_req + first_row) continue;
+
                     Entry e = my_entries[idx];
                     e.row = req_row;
-                    if (e.col >= first_row && e.col <= last_row)
+                    if (e.col >= first_row && e.col <= last_row) {
                         e.col = inv_perm[e.col - first_row] + first_row;
+                    }
                     to_send.push_back(e);
                 }
             }
-            to_send_by_dest[dest] = move(to_send);
+            int size = to_send.size();
+            MPI_Send(&size, 1, MPI_INT, dest, 2, MPI_COMM_WORLD);
+            if (size > 0)
+                MPI_Send(to_send.data(), size * sizeof(Entry), MPI_BYTE, dest, 3, MPI_COMM_WORLD);
         }
-        // The size buffers have to stay alive until the matching Waitall below:
-        // MPI_Isend only records the pointer, so a per-iteration local would be
-        // a dangling read by the time the transfer actually happens.
-        vector<int> send_sizes(to_send_by_dest.size());
-        {
-            int k = 0;
-            for (auto& [dest, buf] : to_send_by_dest) {
-                send_sizes[k] = (int)buf.size();
-                MPI_Request r;
-                MPI_Isend(&send_sizes[k], 1, MPI_INT, dest, 2, MPI_COMM_WORLD, &r);
-                size_send_reqs.push_back(r);
-                k++;
+
+        // Restore local sep rows.
+        for (auto& e : my_entries) {
+            if (row_types[e.row - first_row] == 1) {
+                for (auto& orig : A_sep) {
+                    if (orig.row == e.row && orig.col == e.col) {
+                        e.val = orig.val;
+                        break;
+                    }
+                }
             }
-        }
-
-        MPI_Waitall(size_recv_reqs.size(), size_recv_reqs.data(), MPI_STATUSES_IGNORE);
-
-        // ---- Now that we know sizes, post data receives ----
-        vector<vector<Entry>> recv_bufs(rank);
-        vector<MPI_Request> data_recv_reqs;
-        for (int src = 0; src < rank; src++) {
-            if (sizes[src] > 0) {
-                recv_bufs[src].resize(sizes[src]);
-                MPI_Request r;
-                MPI_Irecv(recv_bufs[src].data(), sizes[src] * sizeof(Entry), MPI_BYTE,
-                        src, 3, MPI_COMM_WORLD, &r);
-                data_recv_reqs.push_back(r);
-            }
-        }
-
-        vector<MPI_Request> data_send_reqs;
-        for (auto& [dest, buf] : to_send_by_dest) {
-            if (!buf.empty()) {
-                MPI_Request r;
-                MPI_Isend(buf.data(), buf.size() * sizeof(Entry), MPI_BYTE,
-                        dest, 3, MPI_COMM_WORLD, &r);
-                data_send_reqs.push_back(r);
-            }
-        }
-
-        MPI_Waitall(data_recv_reqs.size(), data_recv_reqs.data(), MPI_STATUSES_IGNORE);
-
-        vector<Entry> R_sep;
-        for (int src = 0; src < rank; src++) {
-            for (auto e : recv_bufs[src]) {
-                if (e.col >= first_row && e.col <= last_row)
-                    e.col = perm[e.col - first_row] + first_row;
-                R_sep.push_back(e);
-            }
-        }
-
-        // Make sure all our sends have actually completed before we touch/reuse buffers
-        MPI_Waitall(size_send_reqs.size(), size_send_reqs.data(), MPI_STATUSES_IGNORE);
-        MPI_Waitall(data_send_reqs.size(), data_send_reqs.data(), MPI_STATUSES_IGNORE);
-
-        // Remember the current separator values, then reset them to the
-        // original A values before re-factorizing.
-        for (size_t k = sep_start_idx; k < my_entries.size(); k++) {
-            prev_vals[k] = my_entries[k].val;
-            my_entries[k].val = A_sep_vals[k];
         }
 
         // Factorize sep rows
-        map<int, vector<Entry*>> pivot_sep;
-        for (auto& e : R_sep) pivot_sep[e.row].push_back(&e);
+        map<int, vector<Entry*>> pivot_rows;
+        for (auto& e : R_int) pivot_rows[e.row].push_back(&e);
+        for (auto& e : R_sep) pivot_rows[e.row].push_back(&e);
 
-        for (int i = first_sep; i < (int)row_types.size(); i++) {
+        for (int i = 0; i < (int)row_types.size(); i++) {
+            if (row_types[i] != 1) continue;
             for (int e_idx = row_start[i]; e_idx < row_start[i+1]; e_idx++) {
                 int col = my_entries[e_idx].col;
                 if (col >= first_row) continue;
-                // A remote row is either interior or separator on its owner,
-                // so at most one of the two indices holds it.
-                const vector<Entry*>* prow_p = nullptr;
-                auto it_sep = pivot_sep.find(col);
-                if (it_sep != pivot_sep.end()) prow_p = &it_sep->second;
-                else {
-                    auto it_int = pivot_int.find(col);
-                    if (it_int != pivot_int.end()) prow_p = &it_int->second;
-                }
-                if (prow_p == nullptr) continue;
-                const vector<Entry*>& prow = *prow_p;
+                if (pivot_rows.find(col) == pivot_rows.end()) continue;
+                auto& prow = pivot_rows[col];
                 double pivot = 0.0;
                 for (auto* e : prow) { if (e->col == col) { pivot = e->val; break; } }
                 if (abs(pivot) < 1e-14) continue;
                 my_entries[e_idx].val /= pivot;
                 double L_ent = my_entries[e_idx].val;
                 for (auto* e : prow) {
-                    if (e->col <= col) continue;
+                    // The sender already restricted this row to {diagonal} U
+                    // {strictly upper}, using *its own* permuted ordering. We
+                    // cannot redo that test here (we don't know the sender's
+                    // permutation), and we don't need to -- just drop the
+                    // diagonal itself.
+                    if (e->col == col) continue;
                     for (int iidx = row_start[i]; iidx < row_start[i+1]; iidx++) {
                         if (my_entries[iidx].col == e->col) {
                             my_entries[iidx].val -= L_ent * e->val;
@@ -526,11 +463,9 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
             }
         }
 
-        // Interior entries are untouched by this loop, so only the separator
-        // tail can have changed.
         double max_change = 0.0;
-        for (size_t k = sep_start_idx; k < my_entries.size(); k++)
-            max_change = max(max_change, abs(my_entries[k].val - prev_vals[k]));
+        for (size_t i = 0; i < my_entries.size(); i++)
+            max_change = max(max_change, abs(my_entries[i].val - old_entries[i].val));
 
         double global_max;
         MPI_Allreduce(&max_change, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
@@ -600,46 +535,32 @@ void ILU_solve(struct ILUFact* ilu, const double* b, double* res) {
         }
     }
 
-    // Establish exact message sizes for every rank pair via a single
-    // collective, instead of a hand-rolled point-to-point size handshake.
-    // This can't stall the way ad-hoc pairwise negotiation can at scale --
-    // MPI_Alltoall is implemented internally to make guaranteed progress
-    // regardless of rank count or traffic density.
-    vector<int> send_counts(world_size, 0);
-    vector<vector<int>> send_lists(world_size);
-    for (auto& kv : dep_rows) {
-        send_lists[kv.first] = vector<int>(kv.second.begin(), kv.second.end());
-        send_counts[kv.first] = (int)send_lists[kv.first].size();
-    }
-    vector<int> recv_counts(world_size, 0);
-    MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
-
-    vector<MPI_Request> req_send_reqs;
     for (int src = 0; src < rank; src++) {
-        if (send_counts[src] > 0) {
-            MPI_Request rq;
-            MPI_Isend(send_lists[src].data(), send_counts[src], MPI_INT, src, 11, MPI_COMM_WORLD, &rq);
-            req_send_reqs.push_back(rq);
-        }
+        vector<int> needed(dep_rows[src].begin(), dep_rows[src].end());
+        int size = needed.size();
+        MPI_Send(&size, 1, MPI_INT, src, 10, MPI_COMM_WORLD);
+        if (size > 0)
+            MPI_Send(needed.data(), size, MPI_INT, src, 11, MPI_COMM_WORLD);
     }
 
     map<int, vector<int>> incoming_requests;
     for (int dest = rank + 1; dest < world_size; dest++) {
-        if (recv_counts[dest] > 0) {
-            vector<int> req(recv_counts[dest]);
-            MPI_Recv(req.data(), recv_counts[dest], MPI_INT, dest, 11, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            incoming_requests[dest] = req;
-        }
+        int size;
+        MPI_Recv(&size, 1, MPI_INT, dest, 10, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        vector<int> req(size);
+        if (size > 0)
+            MPI_Recv(req.data(), size, MPI_INT, dest, 11, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        incoming_requests[dest] = req;
     }
-    if (!req_send_reqs.empty())
-        MPI_Waitall((int)req_send_reqs.size(), req_send_reqs.data(), MPI_STATUSES_IGNORE);
 
     map<int, double> y_ext;
     for (int src = 0; src < rank; src++) {
-        if (send_counts[src] > 0) {
-            vector<double> vals(send_counts[src]);
-            MPI_Recv(vals.data(), send_counts[src], MPI_DOUBLE, src, 12, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            for (int k = 0; k < send_counts[src]; k++) y_ext[send_lists[src][k]] = vals[k];
+        vector<int> needed(dep_rows[src].begin(), dep_rows[src].end());
+        int size = needed.size();
+        if (size > 0) {
+            vector<double> vals(size);
+            MPI_Recv(vals.data(), size, MPI_DOUBLE, src, 12, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            for (int k = 0; k < size; k++) y_ext[needed[k]] = vals[k];
         }
     }
 
@@ -657,21 +578,14 @@ void ILU_solve(struct ILUFact* ilu, const double* b, double* res) {
         y[i] = sum;
     }
 
-    vector<MPI_Request> val_send_reqs;
-    vector<vector<double>> val_send_bufs;
     for (int dest = rank + 1; dest < world_size; dest++) {
-        auto it = incoming_requests.find(dest);
-        if (it == incoming_requests.end()) continue;
-        val_send_bufs.emplace_back();
-        auto& vals = val_send_bufs.back();
-        for (int global_row : it->second)
+        auto& req = incoming_requests[dest];
+        vector<double> vals;
+        for (int global_row : req)
             vals.push_back(y[perm[global_row - first_row]]);
-        MPI_Request rq;
-        MPI_Isend(vals.data(), (int)vals.size(), MPI_DOUBLE, dest, 12, MPI_COMM_WORLD, &rq);
-        val_send_reqs.push_back(rq);
+        if (!vals.empty())
+            MPI_Send(vals.data(), vals.size(), MPI_DOUBLE, dest, 12, MPI_COMM_WORLD);
     }
-    if (!val_send_reqs.empty())
-        MPI_Waitall((int)val_send_reqs.size(), val_send_reqs.data(), MPI_STATUSES_IGNORE);
 
     map<int, set<int>> dep_rows_b;
     for (int r = 0; r < local_n; r++) {
@@ -683,41 +597,32 @@ void ILU_solve(struct ILUFact* ilu, const double* b, double* res) {
         }
     }
 
-    vector<int> send_counts_b(world_size, 0);
-    vector<vector<int>> send_lists_b(world_size);
-    for (auto& kv : dep_rows_b) {
-        send_lists_b[kv.first] = vector<int>(kv.second.begin(), kv.second.end());
-        send_counts_b[kv.first] = (int)send_lists_b[kv.first].size();
-    }
-    vector<int> recv_counts_b(world_size, 0);
-    MPI_Alltoall(send_counts_b.data(), 1, MPI_INT, recv_counts_b.data(), 1, MPI_INT, MPI_COMM_WORLD);
-
-    vector<MPI_Request> req_send_reqs_b;
     for (int dest = rank + 1; dest < world_size; dest++) {
-        if (send_counts_b[dest] > 0) {
-            MPI_Request rq;
-            MPI_Isend(send_lists_b[dest].data(), send_counts_b[dest], MPI_INT, dest, 21, MPI_COMM_WORLD, &rq);
-            req_send_reqs_b.push_back(rq);
-        }
+        vector<int> needed(dep_rows_b[dest].begin(), dep_rows_b[dest].end());
+        int size = needed.size();
+        MPI_Send(&size, 1, MPI_INT, dest, 20, MPI_COMM_WORLD);
+        if (size > 0)
+            MPI_Send(needed.data(), size, MPI_INT, dest, 21, MPI_COMM_WORLD);
     }
 
     map<int, vector<int>> incoming_requests_b;
     for (int src = 0; src < rank; src++) {
-        if (recv_counts_b[src] > 0) {
-            vector<int> req(recv_counts_b[src]);
-            MPI_Recv(req.data(), recv_counts_b[src], MPI_INT, src, 21, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            incoming_requests_b[src] = req;
-        }
+        int size;
+        MPI_Recv(&size, 1, MPI_INT, src, 20, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        vector<int> req(size);
+        if (size > 0)
+            MPI_Recv(req.data(), size, MPI_INT, src, 21, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        incoming_requests_b[src] = req;
     }
-    if (!req_send_reqs_b.empty())
-        MPI_Waitall((int)req_send_reqs_b.size(), req_send_reqs_b.data(), MPI_STATUSES_IGNORE);
 
     map<int, double> x_ext;
     for (int dest = rank + 1; dest < world_size; dest++) {
-        if (send_counts_b[dest] > 0) {
-            vector<double> vals(send_counts_b[dest]);
-            MPI_Recv(vals.data(), send_counts_b[dest], MPI_DOUBLE, dest, 22, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            for (int k = 0; k < send_counts_b[dest]; k++) x_ext[send_lists_b[dest][k]] = vals[k];
+        vector<int> needed(dep_rows_b[dest].begin(), dep_rows_b[dest].end());
+        int size = needed.size();
+        if (size > 0) {
+            vector<double> vals(size);
+            MPI_Recv(vals.data(), size, MPI_DOUBLE, dest, 22, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            for (int k = 0; k < size; k++) x_ext[needed[k]] = vals[k];
         }
     }
 
@@ -753,21 +658,14 @@ void ILU_solve(struct ILUFact* ilu, const double* b, double* res) {
         x[r] = sum / diag;
     }
 
-    vector<MPI_Request> val_send_reqs_b;
-    vector<vector<double>> val_send_bufs_b;
     for (int src = 0; src < rank; src++) {
-        auto it = incoming_requests_b.find(src);
-        if (it == incoming_requests_b.end()) continue;
-        val_send_bufs_b.emplace_back();
-        auto& vals = val_send_bufs_b.back();
-        for (int global_row : it->second)
+        auto& req = incoming_requests_b[src];
+        vector<double> vals;
+        for (int global_row : req)
             vals.push_back(x[perm[global_row - first_row]]);
-        MPI_Request rq;
-        MPI_Isend(vals.data(), (int)vals.size(), MPI_DOUBLE, src, 22, MPI_COMM_WORLD, &rq);
-        val_send_reqs_b.push_back(rq);
+        if (!vals.empty())
+            MPI_Send(vals.data(), vals.size(), MPI_DOUBLE, src, 22, MPI_COMM_WORLD);
     }
-    if (!val_send_reqs_b.empty())
-        MPI_Waitall((int)val_send_reqs_b.size(), val_send_reqs_b.data(), MPI_STATUSES_IGNORE);
 
     for (int local_old = 0; local_old < local_n; local_old++) {
         res[local_old] = x[perm[local_old]];
@@ -806,11 +704,9 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
 
     map<int, double> ext_vals;
     {
-        // Establish exact per-rank message sizes via one collective, up
-        // front, instead of a hand-rolled point-to-point size handshake
-        // (tag 10) done independently by every rank.
         vector<vector<int>> send_bufs(world_size);
-        vector<int> send_counts(world_size, 0);
+        vector<MPI_Request> ask_reqs, ans_reqs;
+
         for (int src = 0; src < world_size; src++) {
             if (src == rank) continue;
             if (src > rank) {
@@ -818,54 +714,64 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
             } else {
                 send_bufs[src] = vector<int>(l_dep_rows[src].begin(), l_dep_rows[src].end());
             }
-            send_counts[src] = (int)send_bufs[src].size();
-        }
-
-        vector<int> recv_counts(world_size, 0);
-        MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
-
-        vector<MPI_Request> ask_reqs, ans_reqs;
-        for (int src = 0; src < world_size; src++) {
-            if (src == rank) continue;
-            if (send_counts[src] > 0) {
+            int size = send_bufs[src].size();
+            MPI_Request r1;
+            MPI_Isend(&size, 1, MPI_INT, src, 10, MPI_COMM_WORLD, &r1);
+            ask_reqs.push_back(r1);
+            if (size > 0) {
                 MPI_Request r2;
-                MPI_Isend(send_bufs[src].data(), send_counts[src], MPI_INT, src, 11, MPI_COMM_WORLD, &r2);
+                MPI_Isend(send_bufs[src].data(), size, MPI_INT, src, 11, MPI_COMM_WORLD, &r2);
                 ask_reqs.push_back(r2);
             }
         }
 
-        vector<vector<double>> ans_bufs(world_size);
         for (int dest = 0; dest < world_size; dest++) {
             if (dest == rank) continue;
-            if (recv_counts[dest] > 0) {
-                vector<int> req(recv_counts[dest]);
-                MPI_Recv(req.data(), recv_counts[dest], MPI_INT, dest, 11, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            int size;
+            MPI_Recv(&size, 1, MPI_INT, dest, 10, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            vector<int> req(size);
+            vector<double> vals;
+            if (size > 0) {
+                MPI_Recv(req.data(), size, MPI_INT, dest, 11, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 for (auto col : req) {
                     int local_col = col - first_row;
-                    ans_bufs[dest].push_back(b[local_col]);
+                    vals.push_back(b[local_col]);
                 }
+            }
+            MPI_Request r1;
+            MPI_Isend(&size, 1, MPI_INT, dest, 0, MPI_COMM_WORLD, &r1);
+            ans_reqs.push_back(r1);
+            if (size > 0) {
                 MPI_Request r2;
-                MPI_Isend(ans_bufs[dest].data(), recv_counts[dest], MPI_DOUBLE, dest, 1, MPI_COMM_WORLD, &r2);
+                MPI_Isend(vals.data(), size, MPI_DOUBLE, dest, 1, MPI_COMM_WORLD, &r2);
                 ans_reqs.push_back(r2);
             }
         }
 
-        if (!ask_reqs.empty())
-            MPI_Waitall((int)ask_reqs.size(), ask_reqs.data(), MPI_STATUSES_IGNORE);
+        MPI_Waitall(ask_reqs.size(), ask_reqs.data(), MPI_STATUSES_IGNORE);
 
+        // recv data
+    
         for (int src = 0; src < world_size; src++) {
             if (src == rank) continue;
-            if (send_counts[src] > 0) {
-                vector<double> vals(send_counts[src]);
-                MPI_Recv(vals.data(), send_counts[src], MPI_DOUBLE, src, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                for (int i = 0; i < send_counts[src]; i++) {
-                    ext_vals[send_bufs[src][i]] = vals[i];
+            vector<int> requested;
+            if (src > rank) {
+                requested = vector<int>(u_dep_rows[src].begin(), u_dep_rows[src].end());
+            } else {
+                requested = vector<int>(l_dep_rows[src].begin(), l_dep_rows[src].end());
+            }
+            int size;
+            MPI_Recv(&size, 1, MPI_INT, src, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            if (size > 0) {
+                vector<double> vals(size);
+                MPI_Recv(vals.data(), size, MPI_DOUBLE, src, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                for (int i = 0; i < size; i++) {
+                    ext_vals[requested[i]] = vals[i];
                 }
             }
         }
 
-        if (!ans_reqs.empty())
-            MPI_Waitall((int)ans_reqs.size(), ans_reqs.data(), MPI_STATUSES_IGNORE);
+        MPI_Waitall(ans_reqs.size(), ans_reqs.data(), MPI_STATUSES_IGNORE);
     }
 
     for (int i = 0; i < local_n; i++) {
@@ -884,7 +790,8 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
 
     {
         vector<vector<int>> send_bufs(world_size);
-        vector<int> send_counts(world_size, 0);
+        vector<MPI_Request> ask_reqs, ans_reqs;
+
         for (int src = 0; src < world_size; src++) {
             if (src == rank) continue;
             if (src > rank) {
@@ -892,56 +799,64 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
             } else {
                 send_bufs[src] = vector<int>(l_dep_rows[src].begin(), l_dep_rows[src].end());
             }
-            send_counts[src] = (int)send_bufs[src].size();
-        }
-
-        vector<int> recv_counts(world_size, 0);
-        MPI_Alltoall(send_counts.data(), 1, MPI_INT, recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
-
-        vector<MPI_Request> ask_reqs, ans_reqs;
-        for (int src = 0; src < world_size; src++) {
-            if (src == rank) continue;
-            if (send_counts[src] > 0) {
+            int size = send_bufs[src].size();
+            MPI_Request r1;
+            MPI_Isend(&size, 1, MPI_INT, src, 10, MPI_COMM_WORLD, &r1);
+            ask_reqs.push_back(r1);
+            if (size > 0) {
                 MPI_Request r2;
-                MPI_Isend(send_bufs[src].data(), send_counts[src], MPI_INT, src, 11, MPI_COMM_WORLD, &r2);
+                MPI_Isend(send_bufs[src].data(), size, MPI_INT, src, 11, MPI_COMM_WORLD, &r2);
                 ask_reqs.push_back(r2);
             }
         }
 
-        vector<vector<double>> ans_bufs(world_size);
         for (int dest = 0; dest < world_size; dest++) {
             if (dest == rank) continue;
-            if (recv_counts[dest] > 0) {
-                vector<int> req(recv_counts[dest]);
-                MPI_Recv(req.data(), recv_counts[dest], MPI_INT, dest, 11, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            int size;
+            MPI_Recv(&size, 1, MPI_INT, dest, 10, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            vector<int> req(size);
+            vector<double> vals;
+            if (size > 0) {
+                MPI_Recv(req.data(), size, MPI_INT, dest, 11, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 for (auto col : req) {
                     int local_col = col - first_row;
-                    ans_bufs[dest].push_back(partial[perm[local_col]]);
+                    vals.push_back(partial[perm[local_col]]);
                 }
+            }
+            MPI_Request r1;
+            MPI_Isend(&size, 1, MPI_INT, dest, 0, MPI_COMM_WORLD, &r1);
+            ans_reqs.push_back(r1);
+            if (size > 0) {
                 MPI_Request r2;
-                MPI_Isend(ans_bufs[dest].data(), recv_counts[dest], MPI_DOUBLE, dest, 1, MPI_COMM_WORLD, &r2);
+                MPI_Isend(vals.data(), size, MPI_DOUBLE, dest, 1, MPI_COMM_WORLD, &r2);
                 ans_reqs.push_back(r2);
             }
         }
 
-        if (!ask_reqs.empty())
-            MPI_Waitall((int)ask_reqs.size(), ask_reqs.data(), MPI_STATUSES_IGNORE);
+        MPI_Waitall(ask_reqs.size(), ask_reqs.data(), MPI_STATUSES_IGNORE);
 
         // recv data
         ext_vals.clear();
         for (int src = 0; src < world_size; src++) {
             if (src == rank) continue;
-            if (send_counts[src] > 0) {
-                vector<double> vals(send_counts[src]);
-                MPI_Recv(vals.data(), send_counts[src], MPI_DOUBLE, src, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                for (int i = 0; i < send_counts[src]; i++) {
-                    ext_vals[send_bufs[src][i]] = vals[i];
+            vector<int> requested;
+            if (src > rank) {
+                requested = vector<int>(u_dep_rows[src].begin(), u_dep_rows[src].end());
+            } else {
+                requested = vector<int>(l_dep_rows[src].begin(), l_dep_rows[src].end());
+            }
+            int size;
+            MPI_Recv(&size, 1, MPI_INT, src, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            if (size > 0) {
+                vector<double> vals(size);
+                MPI_Recv(vals.data(), size, MPI_DOUBLE, src, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                for (int i = 0; i < size; i++) {
+                    ext_vals[requested[i]] = vals[i];
                 }
             }
         }
 
-        if (!ans_reqs.empty())
-            MPI_Waitall((int)ans_reqs.size(), ans_reqs.data(), MPI_STATUSES_IGNORE);
+        MPI_Waitall(ans_reqs.size(), ans_reqs.data(), MPI_STATUSES_IGNORE);
     }
 
     for (int i = 0; i < local_n; i++) {
