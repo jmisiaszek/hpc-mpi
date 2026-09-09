@@ -1,0 +1,13 @@
+*.o
+*.out
+*.err
+example_test.my
+test.my
+test_ign.my
+example_test.ign
+test.ign
+test_ign.ign
+example_test.old
+test.old
+test_ign.old
+*.mtx
