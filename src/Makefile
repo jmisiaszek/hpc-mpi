@@ -15,7 +15,7 @@ ign: $(IGN_BINS)
 old: $(OLD_BINS)
 
 %.o: %.cpp $(DEPS)
-	$(CXX) $(CXXFLAGS) -c -o $@ $
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 %.my: %.o $(OBJ)
 	$(CXX) $(CXXFLAGS) -o $@ $^
