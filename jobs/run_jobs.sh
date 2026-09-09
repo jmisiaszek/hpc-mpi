@@ -15,7 +15,7 @@ source .venv/bin/activate   # keep if you still need the venv for anything else;
                             # are pre-generated, not generated here.
 
 WORKERS=$SLURM_NTASKS
-TEST_BIN=./src/test
+TEST_BIN=./src/test.my
 MATRICES=(1m2d.mtx 1m3d.mtx)
 PERF_REPS=20     # repetitions *inside* the binary for solve/multiply averaging
 REPEATS=3        # separate full re-runs per matrix, for median-based noise reduction
