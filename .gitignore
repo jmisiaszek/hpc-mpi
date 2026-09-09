@@ -12,3 +12,4 @@ test.old
 test_ign.old
 *.mtx
 logs/*
+.venv/
