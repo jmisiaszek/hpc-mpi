@@ -7,6 +7,7 @@
 #include<map>
 #include<cassert>
 #include<cstdio>
+#include<cstdarg>
 #include<unordered_map>
 
 #include "ilu.h"
@@ -40,6 +41,18 @@ struct ILUFact {
 
 std::ostream& operator<<(std::ostream& os, const Entry& obj) {
     return os << "(" << obj.row << ", " << obj.col << ", " << obj.val << ")";
+}
+
+
+// Rank-0 progress checkpoint. Uses stderr (unbuffered) so it survives a hang.
+static void ckpt(int rank, const char* fmt, ...) {
+    if (rank != 0) return;
+    va_list ap; va_start(ap, fmt);
+    fprintf(stderr, "[ilu] ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    fflush(stderr);
 }
 
 int rank_to_row(int N, int world_size, int rank) {
@@ -164,8 +177,18 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
         }
     }
 
+    ckpt(rank, "distribute done");
+
     // 2. Split into interior / separator groups.
     vector<int> row_types = check_int_sep(first_row, last_row, my_entries);
+
+    {
+        int n_int = 0;
+        for (int t : row_types) if (t == 0) n_int++;
+        fprintf(stderr, "[ilu] rank %d: interior=%d separator=%d\n",
+                rank, n_int, (int)row_types.size() - n_int);
+        fflush(stderr);
+    }
 
     // 3. Reorder the rows.
     vector<int> perm(row_types.size());
@@ -233,6 +256,8 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
             }
         }
     }
+
+    ckpt(rank, "interior factorization done");
 
     // 5. Send and receive U_int between processes.
 
@@ -314,6 +339,8 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
     // rows are ever looked up; local rows keyed by their permuted global id
     // could never match, and appending them costs O(local_nnz) per
     // convergence iteration in the pivot map rebuild.
+
+    ckpt(rank, "R_int exchange done, R_int size=%zu", R_int.size());
 
     // 6. Initialize L_sep and U_sep
     vector<Entry> L_sep, U_sep;
@@ -419,6 +446,8 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
                 MPI_Send(to_send.data(), size * sizeof(Entry), MPI_BYTE, dest, 3, MPI_COMM_WORLD);
         }
 
+        ckpt(rank, "  iter %d: row exchange done", iter + 1);
+
         // Restore local sep rows.
         for (auto& e : my_entries) {
             if (row_types[e.row - first_row] == 1) {
@@ -502,6 +531,8 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
         }
     }
 
+
+    ckpt(rank, "convergence loop finished after %d iters", iter);
 
     struct ILUFact* result = new ILUFact();
 
