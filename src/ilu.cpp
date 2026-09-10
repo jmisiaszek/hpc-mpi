@@ -414,38 +414,67 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
     unordered_map<int, vector<Entry*>> pivot_int;
     for (auto& e : R_int) pivot_int[e.row].push_back(&e);
 
+    // Which rows we need from which lower rank depends only on the sparsity
+    // pattern (columns and row_types), never on the values -- so it is
+    // identical on every convergence iteration. Compute and exchange it once
+    // here instead of rebuilding an O(rank * local_nnz) scan and repeating the
+    // exchange every pass.
+    //
+    // The sends are non-blocking because this exchange has the unsafe
+    // ordering (send to lower ranks before receiving from higher ones). It
+    // happened to work on these Laplacians only because a rank requests a
+    // non-empty list solely from rank-1, leaving every other send zero-length
+    // and therefore eager. A stencil coupling to a non-adjacent lower rank
+    // would make those sends large and reintroduce the circular wait.
+    map<int, vector<int> > req_send;
+    map<int, int> req_send_size;
+    for (int src = 0; src < rank; src++) {
+        req_send[src] = vector<int>();
+        req_send_size[src] = 0;
+    }
+    {
+        // One pass over the pattern, bucketed by owner.
+        map<int, set<int> > need;
+        for (auto& e : my_entries) {
+            if (row_types[e.row - first_row] == 1 && e.col < first_row) {
+                need[row_to_rank(N, world_size, e.col)].insert(e.col);
+            }
+        }
+        for (auto& kv : need) {
+            req_send[kv.first] = vector<int>(kv.second.begin(), kv.second.end());
+            req_send_size[kv.first] = (int) req_send[kv.first].size();
+        }
+    }
+
+    vector<MPI_Request> req_reqs;
+    for (int src = 0; src < rank; src++) {
+        MPI_Request r;
+        MPI_Isend(&req_send_size[src], 1, MPI_INT, src, 0, MPI_COMM_WORLD, &r);
+        req_reqs.push_back(r);
+        if (req_send_size[src] > 0) {
+            MPI_Isend(req_send[src].data(), req_send_size[src], MPI_INT,
+                      src, 1, MPI_COMM_WORLD, &r);
+            req_reqs.push_back(r);
+        }
+    }
+
+    map<int, vector<int> > incoming_req;
+    for (int dest = rank + 1; dest < world_size; dest++) {
+        int size;
+        MPI_Recv(&size, 1, MPI_INT, dest, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        vector<int> req(size);
+        if (size > 0)
+            MPI_Recv(req.data(), size, MPI_INT, dest, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        incoming_req[dest] = req;
+    }
+
+    if (!req_reqs.empty())
+        MPI_Waitall((int) req_reqs.size(), req_reqs.data(), MPI_STATUSES_IGNORE);
+
     int iter = 0;
     const int MAX_ITER = 50;
     while(true) {
         vector<Entry> old_entries = my_entries;
-
-        // Send out row requests.
-        for (int src = 0; src < rank; src++) {
-            set<int> need;
-            for (auto& e : my_entries) {
-                if (row_types[e.row - first_row] == 1 && e.col < first_row) {
-                    if (row_to_rank(N, world_size, e.col) == src) {
-                        need.insert(e.col);
-                    }
-                }
-            }
-            vector<int> tgs(need.begin(), need.end());
-            int size = tgs.size();
-            MPI_Send(&size, 1, MPI_INT, src, 0, MPI_COMM_WORLD);
-            if (size > 0)
-                MPI_Send(tgs.data(), size, MPI_INT, src, 1, MPI_COMM_WORLD);
-        }
-
-        // Receive incoming requests.
-        map<int, vector<int>> incoming_req;
-        for (int dest = rank + 1; dest < world_size; dest++) {
-            int size;
-            MPI_Recv(&size, 1, MPI_INT, dest, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            vector<int> req(size);
-            if (size > 0)
-                MPI_Recv(req.data(), size, MPI_INT, dest, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            incoming_req[dest] = req;
-        }
 
         // Receive the row data from lower ranks.
         vector<Entry> R_sep;
