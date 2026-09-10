@@ -133,6 +133,15 @@ def collect(logdir):
     return times, counts, meta, issues
 
 
+def fmt_table_md(rows, headers, aligns=None):
+    """GitHub-flavoured Markdown table; every column right-aligned but the first."""
+    sep = ['---:' if i else '---' for i in range(len(headers))]
+    out = ['| ' + ' | '.join(headers) + ' |',
+           '|' + '|'.join(sep) + '|']
+    out.extend('| ' + ' | '.join(r) + ' |' for r in rows)
+    return '\n'.join(out)
+
+
 def fmt_table(rows, headers, aligns=None):
     cols = len(headers)
     aligns = aligns or ['>'] * cols
@@ -149,7 +158,7 @@ def fmt_table(rows, headers, aligns=None):
     return '\n'.join(out)
 
 
-def report(times, counts, meta, baseline_arg, phases):
+def report(times, counts, meta, baseline_arg, phases, markdown=False):
     for matrix in sorted(times):
         phase_map = times[matrix]
         present = [p for p in phases if p in phase_map]
@@ -166,8 +175,12 @@ def report(times, counts, meta, baseline_arg, phases):
         desc = ', '.join(f'{k}={v}' for k, v in sorted(info.items()))
         title = f'{matrix}' + (f'  ({desc})' if desc else '')
         print()
-        print(title)
-        print('=' * len(title))
+        if markdown:
+            print(f'### {title}')
+            print()
+        else:
+            print(title)
+            print('=' * len(title))
 
         headers = ['P']
         aligns = ['>']
@@ -185,7 +198,7 @@ def report(times, counts, meta, baseline_arg, phases):
                     row += ['-', '-', '-']
                     continue
                 n = counts[matrix][p].get(w, 0)
-                mark = '' if n >= 3 else f'~{n}'
+                mark = '' if n >= 3 else (f' ~{n}' if markdown else f'~{n}')
                 row.append(f'{t:.4f}{mark}')
                 if base:
                     sp = base / t
@@ -195,9 +208,15 @@ def report(times, counts, meta, baseline_arg, phases):
                     row += ['-', '-']
             rows.append(row)
 
-        print(fmt_table(rows, headers, aligns))
-        print(f'median of repeats; speedup and efficiency relative to P={baseline}')
-        print('a ~N suffix means only N repeat(s) were available')
+        if markdown:
+            print(fmt_table_md(rows, headers))
+            print()
+            print(f'Medians across repeats; speedup and efficiency relative to P={baseline}. '
+                  '`~N` marks a cell with only N repeat(s).')
+        else:
+            print(fmt_table(rows, headers, aligns))
+            print(f'median of repeats; speedup and efficiency relative to P={baseline}')
+            print('a ~N suffix means only N repeat(s) were available')
 
 
 def write_csv(path, times, counts, meta):
@@ -230,18 +249,25 @@ def main():
                          'falls back to the smallest available)')
     ap.add_argument('--phase', action='append', dest='phases',
                     help='restrict to a phase; repeatable')
+    ap.add_argument('--md', action='store_true',
+                    help='emit Markdown tables instead of plain text')
     args = ap.parse_args()
 
     phases = args.phases or PHASE_ORDER
 
     times, counts, meta, issues = collect(args.logdir)
-    report(times, counts, meta, args.baseline, phases)
+    report(times, counts, meta, args.baseline, phases, markdown=args.md)
 
     if issues:
-        print('\nWarnings')
-        print('========')
-        for i in issues:
-            print(f'  {i}')
+        if args.md:
+            print('\n### Warnings\n')
+            for i in issues:
+                print(f'- {i}')
+        else:
+            print('\nWarnings')
+            print('========')
+            for i in issues:
+                print(f'  {i}')
 
     if args.csv:
         write_csv(args.csv, times, counts, meta)
