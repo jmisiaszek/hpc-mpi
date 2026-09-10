@@ -182,14 +182,6 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
     // 2. Split into interior / separator groups.
     vector<int> row_types = check_int_sep(first_row, last_row, my_entries);
 
-    {
-        int n_int = 0;
-        for (int t : row_types) if (t == 0) n_int++;
-        fprintf(stderr, "[ilu] rank %d: interior=%d separator=%d\n",
-                rank, n_int, (int)row_types.size() - n_int);
-        fflush(stderr);
-    }
-
     // 3. Reorder the rows.
     vector<int> perm(row_types.size());
     vector<int> inv_perm(row_types.size());
@@ -847,6 +839,8 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
     map<int, double> ext_vals;
     {
         vector<vector<int>> send_bufs(world_size);
+        vector<vector<double>> ans_bufs(world_size);
+        vector<int> ask_sizes(world_size, 0), ans_sizes(world_size, 0);
         vector<MPI_Request> ask_reqs, ans_reqs;
 
         for (int src = 0; src < world_size; src++) {
@@ -856,9 +850,12 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
             } else {
                 send_bufs[src] = vector<int>(l_dep_rows[src].begin(), l_dep_rows[src].end());
             }
-            int size = send_bufs[src].size();
+            // ask_sizes must outlive the loop: the Isend is not complete
+            // until the Waitall below, so a loop-local int is a dangling buffer.
+            ask_sizes[src] = (int) send_bufs[src].size();
+            int size = ask_sizes[src];
             MPI_Request r1;
-            MPI_Isend(&size, 1, MPI_INT, src, 10, MPI_COMM_WORLD, &r1);
+            MPI_Isend(&ask_sizes[src], 1, MPI_INT, src, 10, MPI_COMM_WORLD, &r1);
             ask_reqs.push_back(r1);
             if (size > 0) {
                 MPI_Request r2;
@@ -872,7 +869,11 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
             int size;
             MPI_Recv(&size, 1, MPI_INT, dest, 10, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             vector<int> req(size);
-            vector<double> vals;
+            // ans_bufs / ans_sizes must outlive the loop iteration: at 3D sizes
+            // (10000 doubles = 80KB) these sends go rendezvous, so MPI reads the
+            // buffer at the Waitall -- long after a loop-local vector was freed.
+            vector<double>& vals = ans_bufs[dest];
+            vals.clear();
             if (size > 0) {
                 MPI_Recv(req.data(), size, MPI_INT, dest, 11, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 for (auto col : req) {
@@ -880,8 +881,9 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
                     vals.push_back(b[local_col]);
                 }
             }
+            ans_sizes[dest] = size;
             MPI_Request r1;
-            MPI_Isend(&size, 1, MPI_INT, dest, 0, MPI_COMM_WORLD, &r1);
+            MPI_Isend(&ans_sizes[dest], 1, MPI_INT, dest, 0, MPI_COMM_WORLD, &r1);
             ans_reqs.push_back(r1);
             if (size > 0) {
                 MPI_Request r2;
@@ -932,6 +934,8 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
 
     {
         vector<vector<int>> send_bufs(world_size);
+        vector<vector<double>> ans_bufs(world_size);
+        vector<int> ask_sizes(world_size, 0), ans_sizes(world_size, 0);
         vector<MPI_Request> ask_reqs, ans_reqs;
 
         for (int src = 0; src < world_size; src++) {
@@ -941,9 +945,12 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
             } else {
                 send_bufs[src] = vector<int>(l_dep_rows[src].begin(), l_dep_rows[src].end());
             }
-            int size = send_bufs[src].size();
+            // ask_sizes must outlive the loop: the Isend is not complete
+            // until the Waitall below, so a loop-local int is a dangling buffer.
+            ask_sizes[src] = (int) send_bufs[src].size();
+            int size = ask_sizes[src];
             MPI_Request r1;
-            MPI_Isend(&size, 1, MPI_INT, src, 10, MPI_COMM_WORLD, &r1);
+            MPI_Isend(&ask_sizes[src], 1, MPI_INT, src, 10, MPI_COMM_WORLD, &r1);
             ask_reqs.push_back(r1);
             if (size > 0) {
                 MPI_Request r2;
@@ -957,7 +964,11 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
             int size;
             MPI_Recv(&size, 1, MPI_INT, dest, 10, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             vector<int> req(size);
-            vector<double> vals;
+            // ans_bufs / ans_sizes must outlive the loop iteration: at 3D sizes
+            // (10000 doubles = 80KB) these sends go rendezvous, so MPI reads the
+            // buffer at the Waitall -- long after a loop-local vector was freed.
+            vector<double>& vals = ans_bufs[dest];
+            vals.clear();
             if (size > 0) {
                 MPI_Recv(req.data(), size, MPI_INT, dest, 11, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
                 for (auto col : req) {
@@ -965,8 +976,9 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
                     vals.push_back(partial[perm[local_col]]);
                 }
             }
+            ans_sizes[dest] = size;
             MPI_Request r1;
-            MPI_Isend(&size, 1, MPI_INT, dest, 0, MPI_COMM_WORLD, &r1);
+            MPI_Isend(&ans_sizes[dest], 1, MPI_INT, dest, 0, MPI_COMM_WORLD, &r1);
             ans_reqs.push_back(r1);
             if (size > 0) {
                 MPI_Request r2;
