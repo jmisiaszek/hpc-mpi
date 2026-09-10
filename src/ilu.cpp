@@ -389,11 +389,24 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
     }
 
     // 7. Convergence loop
-    vector<Entry> A_sep;
-    for (auto& e: my_entries) {
-        if (row_types[e.row - first_row] == 1) {
-            A_sep.push_back(e);
-        }
+    //
+    // Snapshot the original separator values positionally. The sparsity
+    // pattern never changes during the loop, so entry k of my_entries always
+    // corresponds to entry k of the snapshot -- no search is needed to find
+    // an entry's original value. (The previous version kept a filtered copy
+    // A_sep and linear-scanned it for every separator entry, which is
+    // O(|A_sep|^2) per iteration: ~2.4e9 comparisons per iteration on the 3D
+    // matrix, and essentially the whole factorize time there.)
+    vector<double> orig_vals(my_entries.size());
+    for (size_t k = 0; k < my_entries.size(); k++) {
+        orig_vals[k] = my_entries[k].val;
+    }
+
+    // Rows to reset each iteration, precomputed so the loop below touches
+    // only separator entries instead of scanning all of my_entries.
+    vector<int> sep_rows;
+    for (int i = 0; i < (int) row_types.size(); i++) {
+        if (row_types[i] == 1) sep_rows.push_back(i);
     }
 
     // R_int is fixed once the step-5 exchange has completed, so index it once
@@ -482,14 +495,10 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
         ckpt(rank, "  iter %d: row exchange done", iter + 1);
 
         // Restore local sep rows.
-        for (auto& e : my_entries) {
-            if (row_types[e.row - first_row] == 1) {
-                for (auto& orig : A_sep) {
-                    if (orig.row == e.row && orig.col == e.col) {
-                        e.val = orig.val;
-                        break;
-                    }
-                }
+        for (size_t q = 0; q < sep_rows.size(); q++) {
+            int i = sep_rows[q];
+            for (int k = row_start[i]; k < row_start[i + 1]; k++) {
+                my_entries[k].val = orig_vals[k];
             }
         }
 
