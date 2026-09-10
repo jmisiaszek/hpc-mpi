@@ -637,15 +637,29 @@ void ILU_solve(struct ILUFact* ilu, const double* b, double* res) {
         }
     }
 
+    // All sends non-blocking: at 3D sizes these requests are ~40KB and the
+    // value arrays ~80KB, both past the shared-memory eager threshold, so
+    // blocking sends here go rendezvous and can deadlock against the receive
+    // loops below. (ILU_multiply already uses this pattern.)
+    vector<MPI_Request> fwd_reqs;
+    map<int, vector<int> > fwd_need;
+    map<int, int> fwd_need_size;
     for (int src = 0; src < rank; src++) {
-        vector<int> needed(dep_rows[src].begin(), dep_rows[src].end());
-        int size = needed.size();
-        MPI_Send(&size, 1, MPI_INT, src, 10, MPI_COMM_WORLD);
-        if (size > 0)
-            MPI_Send(needed.data(), size, MPI_INT, src, 11, MPI_COMM_WORLD);
+        fwd_need[src] = vector<int>(dep_rows[src].begin(), dep_rows[src].end());
+        fwd_need_size[src] = (int) fwd_need[src].size();
+    }
+    for (int src = 0; src < rank; src++) {
+        MPI_Request r;
+        MPI_Isend(&fwd_need_size[src], 1, MPI_INT, src, 10, MPI_COMM_WORLD, &r);
+        fwd_reqs.push_back(r);
+        if (fwd_need_size[src] > 0) {
+            MPI_Isend(fwd_need[src].data(), fwd_need_size[src], MPI_INT,
+                      src, 11, MPI_COMM_WORLD, &r);
+            fwd_reqs.push_back(r);
+        }
     }
 
-    map<int, vector<int>> incoming_requests;
+    map<int, vector<int> > incoming_requests;
     for (int dest = rank + 1; dest < world_size; dest++) {
         int size;
         MPI_Recv(&size, 1, MPI_INT, dest, 10, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -657,12 +671,11 @@ void ILU_solve(struct ILUFact* ilu, const double* b, double* res) {
 
     map<int, double> y_ext;
     for (int src = 0; src < rank; src++) {
-        vector<int> needed(dep_rows[src].begin(), dep_rows[src].end());
-        int size = needed.size();
+        int size = fwd_need_size[src];
         if (size > 0) {
             vector<double> vals(size);
             MPI_Recv(vals.data(), size, MPI_DOUBLE, src, 12, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            for (int k = 0; k < size; k++) y_ext[needed[k]] = vals[k];
+            for (int k = 0; k < size; k++) y_ext[fwd_need[src][k]] = vals[k];
         }
     }
 
@@ -680,13 +693,19 @@ void ILU_solve(struct ILUFact* ilu, const double* b, double* res) {
         y[i] = sum;
     }
 
+    map<int, vector<double> > fwd_vals;
     for (int dest = rank + 1; dest < world_size; dest++) {
-        auto& req = incoming_requests[dest];
+        vector<int>& req = incoming_requests[dest];
         vector<double> vals;
-        for (int global_row : req)
-            vals.push_back(y[perm[global_row - first_row]]);
-        if (!vals.empty())
-            MPI_Send(vals.data(), vals.size(), MPI_DOUBLE, dest, 12, MPI_COMM_WORLD);
+        for (size_t q = 0; q < req.size(); q++)
+            vals.push_back(y[perm[req[q] - first_row]]);
+        if (!vals.empty()) {
+            fwd_vals[dest] = std::move(vals);
+            MPI_Request r;
+            MPI_Isend(fwd_vals[dest].data(), (int) fwd_vals[dest].size(), MPI_DOUBLE,
+                      dest, 12, MPI_COMM_WORLD, &r);
+            fwd_reqs.push_back(r);
+        }
     }
 
     map<int, set<int>> dep_rows_b;
@@ -699,15 +718,25 @@ void ILU_solve(struct ILUFact* ilu, const double* b, double* res) {
         }
     }
 
+    vector<MPI_Request> bwd_reqs;
+    map<int, vector<int> > bwd_need;
+    map<int, int> bwd_need_size;
     for (int dest = rank + 1; dest < world_size; dest++) {
-        vector<int> needed(dep_rows_b[dest].begin(), dep_rows_b[dest].end());
-        int size = needed.size();
-        MPI_Send(&size, 1, MPI_INT, dest, 20, MPI_COMM_WORLD);
-        if (size > 0)
-            MPI_Send(needed.data(), size, MPI_INT, dest, 21, MPI_COMM_WORLD);
+        bwd_need[dest] = vector<int>(dep_rows_b[dest].begin(), dep_rows_b[dest].end());
+        bwd_need_size[dest] = (int) bwd_need[dest].size();
+    }
+    for (int dest = rank + 1; dest < world_size; dest++) {
+        MPI_Request r;
+        MPI_Isend(&bwd_need_size[dest], 1, MPI_INT, dest, 20, MPI_COMM_WORLD, &r);
+        bwd_reqs.push_back(r);
+        if (bwd_need_size[dest] > 0) {
+            MPI_Isend(bwd_need[dest].data(), bwd_need_size[dest], MPI_INT,
+                      dest, 21, MPI_COMM_WORLD, &r);
+            bwd_reqs.push_back(r);
+        }
     }
 
-    map<int, vector<int>> incoming_requests_b;
+    map<int, vector<int> > incoming_requests_b;
     for (int src = 0; src < rank; src++) {
         int size;
         MPI_Recv(&size, 1, MPI_INT, src, 20, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -719,12 +748,11 @@ void ILU_solve(struct ILUFact* ilu, const double* b, double* res) {
 
     map<int, double> x_ext;
     for (int dest = rank + 1; dest < world_size; dest++) {
-        vector<int> needed(dep_rows_b[dest].begin(), dep_rows_b[dest].end());
-        int size = needed.size();
+        int size = bwd_need_size[dest];
         if (size > 0) {
             vector<double> vals(size);
             MPI_Recv(vals.data(), size, MPI_DOUBLE, dest, 22, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            for (int k = 0; k < size; k++) x_ext[needed[k]] = vals[k];
+            for (int k = 0; k < size; k++) x_ext[bwd_need[dest][k]] = vals[k];
         }
     }
 
@@ -760,14 +788,26 @@ void ILU_solve(struct ILUFact* ilu, const double* b, double* res) {
         x[r] = sum / diag;
     }
 
+    map<int, vector<double> > bwd_vals;
     for (int src = 0; src < rank; src++) {
-        auto& req = incoming_requests_b[src];
+        vector<int>& req = incoming_requests_b[src];
         vector<double> vals;
-        for (int global_row : req)
-            vals.push_back(x[perm[global_row - first_row]]);
-        if (!vals.empty())
-            MPI_Send(vals.data(), vals.size(), MPI_DOUBLE, src, 22, MPI_COMM_WORLD);
+        for (size_t q = 0; q < req.size(); q++)
+            vals.push_back(x[perm[req[q] - first_row]]);
+        if (!vals.empty()) {
+            bwd_vals[src] = std::move(vals);
+            MPI_Request r;
+            MPI_Isend(bwd_vals[src].data(), (int) bwd_vals[src].size(), MPI_DOUBLE,
+                      src, 22, MPI_COMM_WORLD, &r);
+            bwd_reqs.push_back(r);
+        }
     }
+
+    // Buffers above stay alive until here.
+    if (!fwd_reqs.empty())
+        MPI_Waitall((int) fwd_reqs.size(), fwd_reqs.data(), MPI_STATUSES_IGNORE);
+    if (!bwd_reqs.empty())
+        MPI_Waitall((int) bwd_reqs.size(), bwd_reqs.data(), MPI_STATUSES_IGNORE);
 
     for (int local_old = 0; local_old < local_n; local_old++) {
         res[local_old] = x[perm[local_old]];
