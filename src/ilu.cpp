@@ -5,9 +5,6 @@
 #include<string>
 #include<set>
 #include<map>
-#include<cassert>
-#include<cstdio>
-#include<cstdarg>
 #include<unordered_map>
 
 #include "ilu.h"
@@ -43,18 +40,6 @@ std::ostream& operator<<(std::ostream& os, const Entry& obj) {
     return os << "(" << obj.row << ", " << obj.col << ", " << obj.val << ")";
 }
 
-
-// Rank-0 progress checkpoint. Uses stderr (unbuffered) so it survives a hang.
-static void ckpt(int rank, const char* fmt, ...) {
-    if (rank != 0) return;
-    va_list ap; va_start(ap, fmt);
-    fprintf(stderr, "[ilu] ");
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
-    va_end(ap);
-    fflush(stderr);
-}
-
 int rank_to_row(int N, int world_size, int rank) {
     return rank * N / world_size;
 }
@@ -66,11 +51,6 @@ int row_to_rank(int N, int world_size, int row) {
 vector<int> check_int_sep(int start_row, int end_row, vector<Entry>& entries) {
     vector<int> rows(end_row - start_row + 1, 0);
     
-    // A row is a separator iff it directly references a column owned by a
-    // lower rank. No transitive propagation: after the symmetric block-local
-    // permutation, interior rows are numbered before separator rows, so every
-    // sub-diagonal column of an interior row is itself an interior row and
-    // its value never changes across convergence iterations.
     for (const auto& e : entries) {
         if (e.col < start_row) {
             rows[e.row - start_row] = 1;
@@ -177,8 +157,6 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
         }
     }
 
-    ckpt(rank, "distribute done");
-
     // 2. Split into interior / separator groups.
     vector<int> row_types = check_int_sep(first_row, last_row, my_entries);
 
@@ -234,11 +212,6 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
         for (int e_idx = row_start[i]; e_idx < row_start[i + 1]; e_idx++) {
             // Entry e = my_entries[e_idx];
             if (my_entries[e_idx].col < i + first_row) {
-                // Invariant: an interior row's sub-diagonal columns are local
-                // interior rows. If this fires, the classification/permutation
-                // pair is inconsistent.
-                assert(my_entries[e_idx].col >= first_row);
-                assert(row_types[my_entries[e_idx].col - first_row] == 0);
                 factorize(
                     my_entries[e_idx].row - first_row, 
                     my_entries[e_idx].col - first_row, 
@@ -248,8 +221,6 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
             }
         }
     }
-
-    ckpt(rank, "interior factorization done");
 
     // 5. Send and receive U_int between processes.
 
@@ -263,19 +234,8 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
     }
 
     // Send out info on dependencies.
-    //
-    // DEADLOCK NOTE: every message below is non-blocking. The previous version
-    // used blocking MPI_Send for the replies and issued them *before* the
-    // receive loop further down. Once every rank had interior rows to serve,
-    // each reply (~48KB for 2D, ~640KB for 3D) exceeded the eager threshold
-    // and went rendezvous, producing a circular wait: rank 0 blocked sending
-    // to rank 1, ..., rank 14 blocked sending to rank 15, while rank 15 sat in
-    // its receive loop waiting on rank 0 (it iterates src in increasing order).
-    // This was invisible under the old classification because only rank 0 had
-    // interior rows, so every other reply was zero-length and therefore eager.
     vector<MPI_Request> pending;
 
-    // Request buffers must stay alive until the final Waitall.
     map<int, vector<int>> req_out;
     map<int, int> req_out_size;
     for (int src = 0; src < rank; src++) {
@@ -305,7 +265,6 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
         incoming[dest] = std::move(requested);
     }
 
-    // Build every reply, then post them all without blocking.
     map<int, vector<Entry>> outbox;
     map<int, int> outbox_size;
     for (auto& kv : incoming) {
@@ -363,17 +322,9 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
         }
     }
 
-    // NOTE: local interior rows are deliberately NOT added to R_int. The
-    // pivot lookup below is guarded by "col < first_row", so only foreign
-    // rows are ever looked up; local rows keyed by their permuted global id
-    // could never match, and appending them costs O(local_nnz) per
-    // convergence iteration in the pivot map rebuild.
-
     if (!pending.empty()) {
         MPI_Waitall((int) pending.size(), pending.data(), MPI_STATUSES_IGNORE);
     }
-
-    ckpt(rank, "R_int exchange done, R_int size=%zu", R_int.size());
 
     // 6. Initialize L_sep and U_sep
     vector<Entry> L_sep, U_sep;
@@ -389,43 +340,19 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
     }
 
     // 7. Convergence loop
-    //
-    // Snapshot the original separator values positionally. The sparsity
-    // pattern never changes during the loop, so entry k of my_entries always
-    // corresponds to entry k of the snapshot -- no search is needed to find
-    // an entry's original value. (The previous version kept a filtered copy
-    // A_sep and linear-scanned it for every separator entry, which is
-    // O(|A_sep|^2) per iteration: ~2.4e9 comparisons per iteration on the 3D
-    // matrix, and essentially the whole factorize time there.)
     vector<double> orig_vals(my_entries.size());
     for (size_t k = 0; k < my_entries.size(); k++) {
         orig_vals[k] = my_entries[k].val;
     }
 
-    // Rows to reset each iteration, precomputed so the loop below touches
-    // only separator entries instead of scanning all of my_entries.
     vector<int> sep_rows;
     for (int i = 0; i < (int) row_types.size(); i++) {
         if (row_types[i] == 1) sep_rows.push_back(i);
     }
 
-    // R_int is fixed once the step-5 exchange has completed, so index it once
-    // rather than rebuilding the map on every convergence iteration.
     unordered_map<int, vector<Entry*>> pivot_int;
     for (auto& e : R_int) pivot_int[e.row].push_back(&e);
 
-    // Which rows we need from which lower rank depends only on the sparsity
-    // pattern (columns and row_types), never on the values -- so it is
-    // identical on every convergence iteration. Compute and exchange it once
-    // here instead of rebuilding an O(rank * local_nnz) scan and repeating the
-    // exchange every pass.
-    //
-    // The sends are non-blocking because this exchange has the unsafe
-    // ordering (send to lower ranks before receiving from higher ones). It
-    // happened to work on these Laplacians only because a rank requests a
-    // non-empty list solely from rank-1, leaving every other send zero-length
-    // and therefore eager. A stencil coupling to a non-adjacent lower rank
-    // would make those sends large and reintroduce the circular wait.
     map<int, vector<int> > req_send;
     map<int, int> req_send_size;
     for (int src = 0; src < rank; src++) {
@@ -433,7 +360,6 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
         req_send_size[src] = 0;
     }
     {
-        // One pass over the pattern, bucketed by owner.
         map<int, set<int> > need;
         for (auto& e : my_entries) {
             if (row_types[e.row - first_row] == 1 && e.col < first_row) {
@@ -471,8 +397,6 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
     if (!req_reqs.empty())
         MPI_Waitall((int) req_reqs.size(), req_reqs.data(), MPI_STATUSES_IGNORE);
 
-    int iter = 0;
-    const int MAX_ITER = 50;
     while(true) {
         vector<Entry> old_entries = my_entries;
 
@@ -521,8 +445,6 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
                 MPI_Send(to_send.data(), size * sizeof(Entry), MPI_BYTE, dest, 3, MPI_COMM_WORLD);
         }
 
-        ckpt(rank, "  iter %d: row exchange done", iter + 1);
-
         // Restore local sep rows.
         for (size_t q = 0; q < sep_rows.size(); q++) {
             int i = sep_rows[q];
@@ -532,10 +454,6 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
         }
 
         // Factorize sep rows
-        // R_sep is rebuilt every iteration, so it needs a fresh index; R_int
-        // is reused from pivot_int above. A given foreign row is either
-        // interior or separator on its owner, never both, so the two maps
-        // cannot disagree.
         unordered_map<int, vector<Entry*>> pivot_sep;
         for (auto& e : R_sep) pivot_sep[e.row].push_back(&e);
 
@@ -561,11 +479,6 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
                 my_entries[e_idx].val /= pivot;
                 double L_ent = my_entries[e_idx].val;
                 for (auto* e : prow) {
-                    // The sender already restricted this row to {diagonal} U
-                    // {strictly upper}, using *its own* permuted ordering. We
-                    // cannot redo that test here (we don't know the sender's
-                    // permutation), and we don't need to -- just drop the
-                    // diagonal itself.
                     if (e->col == col) continue;
                     for (int iidx = row_start[i]; iidx < row_start[i+1]; iidx++) {
                         if (my_entries[iidx].col == e->col) {
@@ -589,21 +502,8 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
 
         double global_max;
         MPI_Allreduce(&max_change, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-        iter++;
-        if (rank == 0) {
-            fprintf(stderr, "  [factorize] iter %d  max_change=%.3e\n", iter, global_max);
-            fflush(stderr);
-        }
         if (global_max < 1e-9) break;
-        if (iter >= MAX_ITER) {
-            if (rank == 0)
-                fprintf(stderr, "  [factorize] WARNING: hit MAX_ITER=%d without converging\n", MAX_ITER);
-            break;
-        }
     }
-
-
-    ckpt(rank, "convergence loop finished after %d iters", iter);
 
     struct ILUFact* result = new ILUFact();
 
@@ -667,10 +567,6 @@ void ILU_solve(struct ILUFact* ilu, const double* b, double* res) {
         }
     }
 
-    // All sends non-blocking: at 3D sizes these requests are ~40KB and the
-    // value arrays ~80KB, both past the shared-memory eager threshold, so
-    // blocking sends here go rendezvous and can deadlock against the receive
-    // loops below. (ILU_multiply already uses this pattern.)
     vector<MPI_Request> fwd_reqs;
     map<int, vector<int> > fwd_need;
     map<int, int> fwd_need_size;
@@ -833,7 +729,6 @@ void ILU_solve(struct ILUFact* ilu, const double* b, double* res) {
         }
     }
 
-    // Buffers above stay alive until here.
     if (!fwd_reqs.empty())
         MPI_Waitall((int) fwd_reqs.size(), fwd_reqs.data(), MPI_STATUSES_IGNORE);
     if (!bwd_reqs.empty())
@@ -888,8 +783,6 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
             } else {
                 send_bufs[src] = vector<int>(l_dep_rows[src].begin(), l_dep_rows[src].end());
             }
-            // ask_sizes must outlive the loop: the Isend is not complete
-            // until the Waitall below, so a loop-local int is a dangling buffer.
             ask_sizes[src] = (int) send_bufs[src].size();
             int size = ask_sizes[src];
             MPI_Request r1;
@@ -907,9 +800,6 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
             int size;
             MPI_Recv(&size, 1, MPI_INT, dest, 10, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             vector<int> req(size);
-            // ans_bufs / ans_sizes must outlive the loop iteration: at 3D sizes
-            // (10000 doubles = 80KB) these sends go rendezvous, so MPI reads the
-            // buffer at the Waitall -- long after a loop-local vector was freed.
             vector<double>& vals = ans_bufs[dest];
             vals.clear();
             if (size > 0) {
@@ -983,8 +873,6 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
             } else {
                 send_bufs[src] = vector<int>(l_dep_rows[src].begin(), l_dep_rows[src].end());
             }
-            // ask_sizes must outlive the loop: the Isend is not complete
-            // until the Waitall below, so a loop-local int is a dangling buffer.
             ask_sizes[src] = (int) send_bufs[src].size();
             int size = ask_sizes[src];
             MPI_Request r1;
@@ -1002,9 +890,6 @@ void ILU_multiply(struct ILUFact* ilu, const double* b, double* res) {
             int size;
             MPI_Recv(&size, 1, MPI_INT, dest, 10, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
             vector<int> req(size);
-            // ans_bufs / ans_sizes must outlive the loop iteration: at 3D sizes
-            // (10000 doubles = 80KB) these sends go rendezvous, so MPI reads the
-            // buffer at the Waitall -- long after a loop-local vector was freed.
             vector<double>& vals = ans_bufs[dest];
             vals.clear();
             if (size > 0) {
