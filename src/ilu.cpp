@@ -271,16 +271,38 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
     }
 
     // Send out info on dependencies.
+    //
+    // DEADLOCK NOTE: every message below is non-blocking. The previous version
+    // used blocking MPI_Send for the replies and issued them *before* the
+    // receive loop further down. Once every rank had interior rows to serve,
+    // each reply (~48KB for 2D, ~640KB for 3D) exceeded the eager threshold
+    // and went rendezvous, producing a circular wait: rank 0 blocked sending
+    // to rank 1, ..., rank 14 blocked sending to rank 15, while rank 15 sat in
+    // its receive loop waiting on rank 0 (it iterates src in increasing order).
+    // This was invisible under the old classification because only rank 0 had
+    // interior rows, so every other reply was zero-length and therefore eager.
+    vector<MPI_Request> pending;
+
+    // Request buffers must stay alive until the final Waitall.
+    map<int, vector<int>> req_out;
+    map<int, int> req_out_size;
     for (int src = 0; src < rank; src++) {
-        vector<int> need(dep_rows[src].begin(), dep_rows[src].end());
-        int size = need.size();
-        MPI_Send(&size, 1, MPI_INT, src, 0, MPI_COMM_WORLD);
-        if (size > 0) {
-            MPI_Send(need.data(), size, MPI_INT, src, 1, MPI_COMM_WORLD);
+        req_out[src] = vector<int>(dep_rows[src].begin(), dep_rows[src].end());
+        req_out_size[src] = (int) req_out[src].size();
+    }
+    for (int src = 0; src < rank; src++) {
+        MPI_Request r;
+        MPI_Isend(&req_out_size[src], 1, MPI_INT, src, 0, MPI_COMM_WORLD, &r);
+        pending.push_back(r);
+        if (req_out_size[src] > 0) {
+            MPI_Isend(req_out[src].data(), req_out_size[src], MPI_INT,
+                      src, 1, MPI_COMM_WORLD, &r);
+            pending.push_back(r);
         }
     }
 
-    // Receive deps requests and return data.
+    // Receive all incoming requests.
+    map<int, vector<int>> incoming;
     for (int dest = rank + 1; dest < world_size; dest++) {
         int size;
         MPI_Recv(&size, 1, MPI_INT, dest, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -288,9 +310,16 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
         if (size > 0) {
             MPI_Recv(requested.data(), size, MPI_INT, dest, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         }
+        incoming[dest] = std::move(requested);
+    }
 
+    // Build every reply, then post them all without blocking.
+    map<int, vector<Entry>> outbox;
+    map<int, int> outbox_size;
+    for (auto& kv : incoming) {
+        int dest = kv.first;
         vector<Entry> to_send;
-        for (int req_row : requested) {
+        for (int req_row : kv.second) {
             if (req_row < first_row || req_row > last_row) continue;
             int local_req = req_row - first_row;
             int p_req = perm[local_req];
@@ -307,11 +336,19 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
                 to_send.push_back(e);
             }
         }
+        outbox_size[dest] = (int) to_send.size();
+        outbox[dest] = std::move(to_send);
+    }
 
-        size = to_send.size();
-        MPI_Send(&size, 1, MPI_INT, dest, 2, MPI_COMM_WORLD);
-        if (size > 0) {
-            MPI_Send(to_send.data(), size * sizeof(Entry), MPI_BYTE, dest, 3, MPI_COMM_WORLD);
+    for (auto& kv : outbox) {
+        int dest = kv.first;
+        MPI_Request r;
+        MPI_Isend(&outbox_size[dest], 1, MPI_INT, dest, 2, MPI_COMM_WORLD, &r);
+        pending.push_back(r);
+        if (outbox_size[dest] > 0) {
+            MPI_Isend(kv.second.data(), outbox_size[dest] * sizeof(Entry), MPI_BYTE,
+                      dest, 3, MPI_COMM_WORLD, &r);
+            pending.push_back(r);
         }
     }
 
@@ -339,6 +376,10 @@ struct ILUFact* ILU_factorize(int N, int nnz, const int* row, const int* col, co
     // rows are ever looked up; local rows keyed by their permuted global id
     // could never match, and appending them costs O(local_nnz) per
     // convergence iteration in the pivot map rebuild.
+
+    if (!pending.empty()) {
+        MPI_Waitall((int) pending.size(), pending.data(), MPI_STATUSES_IGNORE);
+    }
 
     ckpt(rank, "R_int exchange done, R_int size=%zu", R_int.size());
 
