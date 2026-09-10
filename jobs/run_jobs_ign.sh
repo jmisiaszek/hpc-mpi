@@ -6,7 +6,7 @@
 source .venv/bin/activate
 
 WORKERS=$SLURM_NTASKS
-TEST_BIN=./src/test.my
+TEST_BIN=./src/test.ign
 MATRICES=(1m2d.mtx 1m3d.mtx)
 PERF_REPS=20
 REPEATS=3
