@@ -19,6 +19,7 @@ import sys
 from collections import defaultdict
 
 WORKERS_RE = re.compile(r'^WORKERS=(\d+)')
+NODES_RE = re.compile(r'^NODES=(\d+)')
 MATRIX_RE = re.compile(r'^>> RUNNING_MATRIX=(\S+)')
 PERF_RE = re.compile(r'^PERF,phase=(\w+),(.*)$')
 FAIL_RE = re.compile(r'^(CORRECTNESS|PERF RUN) (FAILED|TIMED OUT) for (\S+)')
@@ -47,6 +48,7 @@ def parse_file(path):
     meta:     {matrix: {'N': int, 'nnz': int}}
     """
     workers = None
+    nodes = None
     matrix = None
     samples = defaultdict(list)
     problems = []
@@ -60,6 +62,11 @@ def parse_file(path):
             m = WORKERS_RE.match(line)
             if m:
                 workers = int(m.group(1))
+                continue
+
+            m = NODES_RE.match(line)
+            if m:
+                nodes = int(m.group(1))
                 continue
 
             m = MATRIX_RE.match(line)
@@ -105,7 +112,7 @@ def parse_file(path):
     if not saw_pass and samples:
         problems.append('no PASSED line seen')
 
-    return workers, samples, problems, meta
+    return workers, nodes, samples, problems, meta
 
 
 def collect(logdir):
@@ -120,7 +127,7 @@ def collect(logdir):
     issues = []
 
     for path in paths:
-        workers, samples, problems, file_meta = parse_file(path)
+        workers, nodes, samples, problems, file_meta = parse_file(path)
         name = os.path.basename(path)
 
         for p in problems:
@@ -134,8 +141,9 @@ def collect(logdir):
         for (matrix, phase), vals in samples.items():
             if workers in times[matrix][phase]:
                 issues.append(
-                    f'{name}: duplicate result for {matrix}/{phase} at P={workers}, '
-                    f'keeping the faster one')
+                    f'{name}: duplicate result for {matrix}/{phase} at P={workers} '
+                    f'(NODES={nodes}) -- runs with different node counts collide here; '
+                    f'parse them from separate directories. Keeping the faster one')
                 prev = times[matrix][phase][workers]
                 times[matrix][phase][workers] = min(prev, statistics.median(vals))
             else:

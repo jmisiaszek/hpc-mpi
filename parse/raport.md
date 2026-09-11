@@ -65,3 +65,20 @@ Medians across repeats; speedup and efficiency relative to P=1. `~N` marks a cel
 | 48 | 0.4153 | 2.03x | 4% | 0.0561 | 49.14x | 102% | 0.3418 | 0.13x | 0% |
 
 Medians across repeats; speedup and efficiency relative to P=1. `~N` marks a cell with only N repeat(s).
+
+
+### P = 16
+
+| max offset | factorize (s) | multiply (s) | solve (s) |
+|---|---:|---:|---:|
+| 4 | 0.3144 | 0.1106 | 0.0189 |
+| 16 | 0.3200 | 0.0920 | 0.0190 |
+| 64 | 0.3139 | 0.1073 | 0.0191 |
+| 256 | 0.3172 | 0.1185 | 0.0197 |
+| 1024 | 0.3036 | 0.1205 | 0.0236 |
+| 4096 | 0.2889 | 0.0964 | 0.0435 |
+| 16384 | 0.3005 | 0.1207 | 0.1543 |
+| 65536 | 0.9599 | 0.2896 | 0.6933 |
+| 131072 | 0.7189 | 0.2659 | 0.5019 |
+
+Medians across repeats. `~N` marks a cell with only N repeat(s).
