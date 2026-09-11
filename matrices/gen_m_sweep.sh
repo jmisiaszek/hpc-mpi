@@ -18,7 +18,7 @@ for m in $OFFSETS; do
         echo "skip (exists): $out"
         continue
     fi
-    python3 tools/gen_banded.py --n "$N" --offset "$m" -o "$out"
+    python3 matrices/gen_banded.py --n "$N" --offset "$m" -o "$out"
 done
 
 echo
