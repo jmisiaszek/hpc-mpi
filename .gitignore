@@ -11,5 +11,4 @@ example_test.old
 test.old
 test_ign.old
 *.mtx
-logs/*
 .venv/
