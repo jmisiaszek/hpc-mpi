@@ -1,5 +1,4 @@
 *.o
-*.out
 *.err
 example_test.my
 test.my
