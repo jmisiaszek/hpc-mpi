@@ -34,7 +34,7 @@ def main():
     ap.add_argument("--out", default="results.csv")
     args = ap.parse_args()
 
-    pattern = os.path.join(args.logdir, "ilu_scale_j*.out")
+    pattern = os.path.join(args.logdir, "ilu_scale_w0_j*.out")
     files = sorted(glob.glob(pattern))
     if not files:
         print(f"No log files found matching {pattern}", file=sys.stderr)
