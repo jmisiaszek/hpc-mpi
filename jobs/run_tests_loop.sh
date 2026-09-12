@@ -5,7 +5,7 @@
 
 source .venv/bin/activate
 
-TESTS_PER_CONFIG=10
+TESTS_PER_CONFIG=20
 WORKERS=$SLURM_NTASKS
 
 echo "=== Starting Scaling Test ==="
@@ -25,14 +25,14 @@ for N_SIZE in 10 100 1000; do
         for i in $(seq 1 $TESTS_PER_CONFIG); do
             
             # Create a highly specific filename to avoid any chance of conflicts
-            MATRIX_FILE="test_matrix_w${WORKERS}_N${N_SIZE}_d${DENSITY}_job${SLURM_JOB_ID}_iter${i}.mtx"
+            MATRIX_FILE="matrices/test_matrix_w${WORKERS}_N${N_SIZE}_d${DENSITY}_job${SLURM_JOB_ID}_iter${i}.mtx"
             
             # 1. Generate the matrix
-            python3 gen_sbatch.py $N_SIZE $DENSITY $MATRIX_FILE
+            python3 matrices/gen_sbatch.py $N_SIZE $DENSITY $MATRIX_FILE
 
             # 2. Reconstruct Test
             START_REC=$(date +%s.%N)
-            srun -n $WORKERS ./example_test $MATRIX_FILE 1
+            srun -n $WORKERS ./src/example_test.my $MATRIX_FILE 1
             REC_CODE=$?
             END_REC=$(date +%s.%N)
             
@@ -41,7 +41,7 @@ for N_SIZE in 10 100 1000; do
 
             # 3. Vector Test
             START_VEC=$(date +%s.%N)
-            srun -n $WORKERS ./example_test $MATRIX_FILE 2
+            srun -n $WORKERS ./src/example_test.my $MATRIX_FILE 2
             VEC_CODE=$?
             END_VEC=$(date +%s.%N)
             
